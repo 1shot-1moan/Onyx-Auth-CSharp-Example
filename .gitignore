@@ -1,0 +1,11 @@
+# Build outputs
+bin/
+obj/
+
+# Visual Studio
+.vs/
+*.user
+*.resx
+
+# Duplicate project file
+OnyxGate-Example.csproj
