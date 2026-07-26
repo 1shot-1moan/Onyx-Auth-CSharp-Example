@@ -27,8 +27,6 @@ namespace OnyxGateExample
         public JsonElement? User      { get; private set; }
         public string?      SessionId { get; private set; }
         public string       ResponseMessage { get; private set; } = "";
-        private string _plan    = "free";
-        private string _expires = "";
 
         [DllImport("kernel32.dll", ExactSpelling = true, SetLastError = true)]
         private static extern bool IsDebuggerPresent();
@@ -293,82 +291,13 @@ namespace OnyxGateExample
 
         public async Task<bool> CheckSecurity() => await Task.Run(() => CheckSecuritySync());
 
-        private static byte[] DeriveKey(string secret)
+        // Parses server SDK response as plain JSON
+        private static JsonElement ParseSecureResponse(string rawText)
         {
-            using var sha = SHA256.Create();
-            return sha.ComputeHash(Encoding.UTF8.GetBytes(string.IsNullOrEmpty(secret) ? "onyx_gate_default_secret" : secret));
-        }
-
-        private static string DecryptAes(string encStr, string secret)
-        {
-            try
-            {
-                var parts = encStr.Split(':');
-                if (parts.Length != 2) return encStr;
-                byte[] iv = Convert.FromHexString(parts[0]);
-                byte[] cipherBytes = Convert.FromHexString(parts[1]);
-                byte[] key = DeriveKey(secret);
-
-                using var aes = Aes.Create();
-                aes.Key = key;
-                aes.IV = iv;
-                aes.Mode = CipherMode.CBC;
-                aes.Padding = PaddingMode.PKCS7;
-
-                using var decryptor = aes.CreateDecryptor();
-                byte[] decryptedBytes = decryptor.TransformFinalBlock(cipherBytes, 0, cipherBytes.Length);
-                return Encoding.UTF8.GetString(decryptedBytes);
-            }
-            catch
-            {
-                return encStr;
-            }
-        }
-
-        private static bool VerifyHmac(string rawData, string signature, string secret)
-        {
-            try
-            {
-                byte[] key = DeriveKey(secret);
-                using var hmac = new HMACSHA256(key);
-                byte[] hash = hmac.ComputeHash(Encoding.UTF8.GetBytes(rawData));
-                string computedHex = Convert.ToHexString(hash).ToLowerInvariant();
-                return string.Equals(computedHex, signature.Trim().ToLowerInvariant(), StringComparison.OrdinalIgnoreCase);
-            }
-            catch
-            {
-                return true;
-            }
-        }
-
-        private JsonElement ParseSecureResponse(HttpResponseMessage res, string rawText)
-        {
-            try
-            {
-                var doc = JsonDocument.Parse(rawText).RootElement;
-                if (doc.ValueKind == JsonValueKind.Object && doc.TryGetProperty("enc", out var encProp))
-                {
-                    string encStr = encProp.GetString() ?? "";
-                    if (doc.TryGetProperty("sig", out var sigProp))
-                    {
-                        string sig = sigProp.GetString() ?? "";
-                        if (!VerifyHmac(encStr, sig, _secret))
-                        {
-                            _ = ReportSecurityFlag("packet_tampering", "HMAC signature mismatch detected on AES payload");
-                            HideAllWindows();
-                            MessageBox(IntPtr.Zero, "Security Violation: Network packet tampering detected.", "Onyx Gate Security", 0x10);
-                            Environment.Exit(0);
-                        }
-                    }
-                    string decryptedJson = DecryptAes(encStr, _secret);
-                    return JsonDocument.Parse(decryptedJson).RootElement;
-                }
-                return doc;
-            }
+            try   { return JsonDocument.Parse(rawText).RootElement; }
             catch (Exception ex)
             {
-                var err = "{\"ok\":false,\"message\":\"" + ex.Message + "\"}";
-                return JsonDocument.Parse(err).RootElement;
+                return JsonDocument.Parse("{\"ok\":false,\"message\":\"" + ex.Message + "\"}").RootElement;
             }
         }
 
@@ -380,7 +309,7 @@ namespace OnyxGateExample
                 var content = new StringContent(json, Encoding.UTF8, "application/json");
                 var res     = _http.PostAsync(BASE + endpoint, content).GetAwaiter().GetResult();
                 var raw     = res.Content.ReadAsStringAsync().GetAwaiter().GetResult();
-                return ParseSecureResponse(res, raw);
+                return ParseSecureResponse(raw);
             }
             catch (Exception ex)
             {
@@ -397,7 +326,7 @@ namespace OnyxGateExample
                 var content = new StringContent(json, Encoding.UTF8, "application/json");
                 var res     = await _http.PostAsync(BASE + endpoint, content);
                 var raw     = await res.Content.ReadAsStringAsync();
-                return ParseSecureResponse(res, raw);
+                return ParseSecureResponse(raw);
             }
             catch (Exception ex)
             {
@@ -421,35 +350,33 @@ namespace OnyxGateExample
             bool ok = r.TryGetProperty("ok", out var o) && o.GetBoolean();
             if (ok)
             {
-                User      = r.GetProperty("user");
+                // Response has a nested "user" object: { ok, user: { username, plan, expires, ... }, sessionId }
+                if (r.TryGetProperty("user", out var userObj))
+                {
+                    User = userObj;
+                }
                 SessionId = r.TryGetProperty("sessionId", out var s) ? s.GetString() : null;
-                _plan     = User?.TryGetProperty("plan", out var pv) == true ? pv.GetString() ?? "free" : "free";
             }
             else
             {
                 string msg = r.TryGetProperty("message", out var m) ? m.GetString() ?? "" : "";
-                if (msg.Contains("banned", StringComparison.OrdinalIgnoreCase) || msg.Contains("blacklisted", StringComparison.OrdinalIgnoreCase))
+                if (msg.Contains("banned", StringComparison.OrdinalIgnoreCase) ||
+                    msg.Contains("blacklisted", StringComparison.OrdinalIgnoreCase))
                 {
                     HideAllWindows();
                     MessageBox(IntPtr.Zero, msg, "Onyx Gate Security — Account Banned", 0x10);
                     Process.GetCurrentProcess().Kill();
                 }
             }
+            ResponseMessage = r.TryGetProperty("message", out var rm) ? rm.GetString() ?? "" : "";
             return r;
         }
 
         public async Task<JsonElement> Validate()
         {
             await CheckSecurity();
-            var apiKey = User.HasValue && User.Value.TryGetProperty("apiKey", out var k)
-                ? k.GetString() ?? "" : "";
-            var r = await Post("/sdk/validate", new { appId = _appId, apiKey, hwid = _hwid });
-            if (r.GetProperty("ok").GetBoolean())
-            {
-                if (r.TryGetProperty("plan",    out var p)) _plan    = p.GetString() ?? _plan;
-                if (r.TryGetProperty("expires", out var e)) _expires = e.GetString() ?? _expires;
-            }
-            return r;
+            var apiKey = User.HasValue && User.Value.TryGetProperty("apiKey", out var k) ? k.GetString() ?? "" : "";
+            return await Post("/sdk/validate", new { appId = _appId, apiKey, hwid = _hwid });
         }
 
         public async Task<JsonElement> Register(
@@ -464,21 +391,15 @@ namespace OnyxGateExample
         {
             try
             {
-                var res = await _http.GetAsync(
-                    $"{BASE}/sdk/variable?appId={_appId}&name={name}");
-                var doc = JsonDocument.Parse(await res.Content.ReadAsStringAsync());
-                return doc.RootElement.TryGetProperty("value", out var v) ? v.GetString() : null;
+                var r = await Post("/sdk/variable", new { appId = _appId, name });
+                return r.TryGetProperty("value", out var v) ? v.GetString() : null;
             }
             catch { return null; }
         }
 
-        public string GetUsername() => User?.GetProperty("username").GetString() ?? "";
-        public string GetPlan()     => _plan;
-        public bool   IsPaid()
-        {
-            var p = GetPlan();
-            return p != "free" && p != "";
-        }
+        public string GetUsername() => User?.TryGetProperty("username", out var u) == true ? u.GetString() ?? "" : "";
+        public string GetPlan()     => User?.TryGetProperty("plan",     out var p) == true ? p.GetString() ?? "free" : "free";
+        public bool   IsPaid()      => GetPlan() != "free" && GetPlan() != "";
     }
 }
 
