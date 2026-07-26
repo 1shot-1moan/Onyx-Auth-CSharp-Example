@@ -8,7 +8,7 @@ namespace OnyxGateExample
     {
         // ╔══════════════════════════════════════════╗
         // ║  ONLY CHANGE THESE TWO LINES             ║
-        private const string APP_ID = "6a6356f72c9481f42186ef1b";
+        private const string APP_ID = "App_Id_Here";
         private const string APP_VERSION = "1.0";
         // ╚══════════════════════════════════════════╝
 
