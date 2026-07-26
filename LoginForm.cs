@@ -8,7 +8,7 @@ namespace OnyxGateExample
     {
         // ╔══════════════════════════════════════════╗
         // ║  ONLY CHANGE THESE TWO LINES             ║
-        private const string APP_ID = "YOUR_APP_ID_HERE";
+        private const string APP_ID = "6a6356f72c9481f42186ef1b";
         private const string APP_VERSION = "1.0";
         // ╚══════════════════════════════════════════╝
 
@@ -16,8 +16,17 @@ namespace OnyxGateExample
 
         public LoginForm()
         {
+            Opacity = 0;
             InitializeComponent();
             AcceptButton = btnLogin;
+            Load += LoginForm_Load;
+        }
+
+        private void LoginForm_Load(object sender, EventArgs e)
+        {
+            _auth.init();
+            _auth.checkblack();
+            Opacity = 1;
         }
 
         // ─────────────────────────────────────────────────────────────────────
@@ -63,9 +72,10 @@ namespace OnyxGateExample
             }
             else
             {
-                lblError.Text    = "✗  " + result.GetProperty("message").GetString();
                 btnLogin.Enabled = true;
                 btnLogin.Text    = "Sign In";
+                string msg       = result.TryGetProperty("message", out var m) ? m.GetString() ?? "Login failed" : "Login failed";
+                lblError.Text    = "✗  " + msg;
             }
         }
 

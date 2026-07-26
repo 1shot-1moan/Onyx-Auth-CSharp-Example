@@ -26,6 +26,7 @@ namespace OnyxGateExample
 
         public JsonElement? User      { get; private set; }
         public string?      SessionId { get; private set; }
+        public string       ResponseMessage { get; private set; } = "";
         private string _plan    = "free";
         private string _expires = "";
 
@@ -35,12 +36,188 @@ namespace OnyxGateExample
         [DllImport("kernel32.dll", SetLastError = true, ExactSpelling = true)]
         private static extern bool CheckRemoteDebuggerPresent(IntPtr hProcess, ref bool isDebuggerPresent);
 
+        [DllImport("user32.dll", CharSet = CharSet.Auto)]
+        private static extern int MessageBox(IntPtr hWnd, string text, string caption, uint type);
+
+        [DllImport("user32.dll")]
+        private static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+        [DllImport("user32.dll")]
+        private static extern bool IsWindowVisible(IntPtr hWnd);
+        private delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+
+        [DllImport("user32.dll")]
+        private static extern bool EnumWindows(EnumWindowsProc enumProc, IntPtr lParam);
+        [DllImport("user32.dll")]
+        private static extern uint GetWindowThreadProcessId(IntPtr hWnd, out int processId);
+        [DllImport("user32.dll")]
+        private static extern bool RedrawWindow(IntPtr hWnd, IntPtr lprcUpdate, IntPtr hrgnUpdate, uint flags);
+        private const int SW_HIDE = 0;
+        private const uint RDW_INVALIDATE = 0x0001;
+        private const uint RDW_ALLCHILDREN = 0x0080;
+        private const uint RDW_UPDATENOW = 0x0100;
+
+        private static void HideAllWindows()
+        {
+            try
+            {
+                int currentProcessId = Process.GetCurrentProcess().Id;
+                EnumWindows((hWnd, lParam) =>
+                {
+                    GetWindowThreadProcessId(hWnd, out int processId);
+                    if (processId == currentProcessId && IsWindowVisible(hWnd))
+                    {
+                        ShowWindow(hWnd, SW_HIDE);
+                    }
+                    return true;
+                }, IntPtr.Zero);
+                RedrawWindow(IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_UPDATENOW);
+            }
+            catch { }
+        }
+
         public SKAuth(string appId, string version = "1.0")
         {
             _appId   = appId;
             _version = version;
             _hwid    = GetHWID();
-            _ = Task.Run(() => CheckSecurity());
+            CheckSecuritySync();
+            checkblack();
+            _ = Task.Run(() => StartAntiDllInjectionMonitor());
+        }
+
+        public void init()
+        {
+            InitSync();
+        }
+
+        public void checkblack()
+        {
+            try
+            {
+                var r = PostSync("/sdk/init", new { appId = _appId, hwid = _hwid, version = _version });
+                bool ok = r.TryGetProperty("ok", out var o) && o.GetBoolean();
+                if (!ok)
+                {
+                    string msg = r.TryGetProperty("message", out var m) ? m.GetString() ?? "" : "";
+                    if (string.IsNullOrEmpty(msg)) msg = "Your HWID or IP address is blacklisted!";
+                    
+                    HideAllWindows();
+                    MessageBox(IntPtr.Zero, msg, "Onyx Gate Security — Access Denied", 0x10);
+                    Environment.Exit(0);
+                }
+            }
+            catch { }
+        }
+
+        public bool checkban(string? username = null)
+        {
+            try
+            {
+                var r = PostSync("/sdk/check-ban", new { appId = _appId, hwid = _hwid, username });
+                bool ok = r.TryGetProperty("ok", out var o) && o.GetBoolean();
+                if (!ok)
+                {
+                    string msg = r.TryGetProperty("message", out var m) ? m.GetString() ?? "" : "";
+                    if (string.IsNullOrEmpty(msg)) msg = "Hardware or IP address is banned!";
+                    
+                    HideAllWindows();
+                    MessageBox(IntPtr.Zero, msg, "Onyx Gate Security — Access Denied", 0x10);
+                    Environment.Exit(0);
+                    return true;
+                }
+            }
+            catch { }
+            return false;
+        }
+
+        public bool InitSync()
+        {
+            try
+            {
+                var r = PostSync("/sdk/init", new { appId = _appId, hwid = _hwid, version = _version });
+                bool ok = r.TryGetProperty("ok", out var o) && o.GetBoolean();
+                ResponseMessage = r.TryGetProperty("message", out var m) ? m.GetString() ?? "" : "";
+                if (!ok)
+                {
+                    if (string.IsNullOrEmpty(ResponseMessage)) ResponseMessage = "Access Denied: Your HWID or IP address is blacklisted.";
+                    return false;
+                }
+            }
+            catch (Exception ex)
+            {
+                ResponseMessage = ex.Message;
+                return false;
+            }
+            return true;
+        }
+
+        public Task<bool> Init() => Task.FromResult(InitSync());
+
+        private async Task StartAntiDllInjectionMonitor()
+        {
+            try
+            {
+                var allowedModules = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+                void AddModulesToAllowed()
+                {
+                    try
+                    {
+                        foreach (ProcessModule mod in Process.GetCurrentProcess().Modules)
+                        {
+                            if (!string.IsNullOrEmpty(mod.FileName))
+                                allowedModules.Add(mod.FileName);
+                        }
+                    }
+                    catch { }
+                }
+
+                // Warmup phase (10 ticks x 500ms = 5s): continuously expand allowed snapshot while app initializes
+                for (int tick = 0; tick < 10; tick++)
+                {
+                    AddModulesToAllowed();
+                    await Task.Delay(500);
+                }
+
+                // Active monitoring phase: check for unknown non-system DLLs injected after warmup
+                while (true)
+                {
+                    await Task.Delay(1500);
+                    string? triggeredMod = null;
+
+                    foreach (ProcessModule mod in Process.GetCurrentProcess().Modules)
+                    {
+                        if (string.IsNullOrEmpty(mod.FileName)) continue;
+                        string filePath = mod.FileName;
+                        string upper = filePath.ToUpper();
+
+                        // Skip trusted Windows system & Program Files directories
+                        if (upper.Contains("C:\\WINDOWS\\") ||
+                            upper.Contains("C:\\PROGRAM FILES\\") ||
+                            upper.Contains("C:\\PROGRAM FILES (X86)\\"))
+                        {
+                            continue;
+                        }
+
+                        // Skip DLLs that were part of the initial warmup snapshot
+                        if (allowedModules.Contains(filePath))
+                            continue;
+
+                        // Foreign/unauthorized DLL injected!
+                        triggeredMod = mod.ModuleName ?? filePath;
+                        break;
+                    }
+
+                    if (triggeredMod != null)
+                    {
+                        await ReportSecurityFlag("dll_injection_detected", "Unauthorized DLL injected: " + triggeredMod);
+                        await Task.Delay(400);
+                        Process.GetCurrentProcess().Kill();
+                        return;
+                    }
+                }
+            }
+            catch { }
         }
 
         private static string GetHWID()
@@ -79,13 +256,13 @@ namespace OnyxGateExample
             catch { }
         }
 
-        public async Task<bool> CheckSecurity()
+        public bool CheckSecuritySync()
         {
             try
             {
                 if (Debugger.IsAttached || IsDebuggerPresent())
                 {
-                    await ReportSecurityFlag("debugger_detected", "Win32/CLR Debugger detected");
+                    _ = ReportSecurityFlag("debugger_detected", "Win32/CLR Debugger detected");
                     return false;
                 }
 
@@ -93,7 +270,7 @@ namespace OnyxGateExample
                 CheckRemoteDebuggerPresent(Process.GetCurrentProcess().Handle, ref isRemotePresent);
                 if (isRemotePresent)
                 {
-                    await ReportSecurityFlag("debugger_detected", "Win32 CheckRemoteDebuggerPresent detected");
+                    _ = ReportSecurityFlag("debugger_detected", "Win32 CheckRemoteDebuggerPresent detected");
                     return false;
                 }
 
@@ -104,7 +281,7 @@ namespace OnyxGateExample
                     {
                         if (proc.ProcessName.ToLower().Contains(name))
                         {
-                            await ReportSecurityFlag("blacklisted_process", $"Detected process: {proc.ProcessName}");
+                            _ = ReportSecurityFlag("blacklisted_process", $"Detected process: {proc.ProcessName}");
                             return false;
                         }
                     }
@@ -112,6 +289,25 @@ namespace OnyxGateExample
             }
             catch { }
             return true;
+        }
+
+        public async Task<bool> CheckSecurity() => await Task.Run(() => CheckSecuritySync());
+
+        private JsonElement PostSync(string endpoint, object body)
+        {
+            try
+            {
+                var json    = JsonSerializer.Serialize(body);
+                var content = new StringContent(json, Encoding.UTF8, "application/json");
+                var res     = _http.PostAsync(BASE + endpoint, content).GetAwaiter().GetResult();
+                var raw     = res.Content.ReadAsStringAsync().GetAwaiter().GetResult();
+                return JsonDocument.Parse(raw).RootElement;
+            }
+            catch (Exception ex)
+            {
+                var err = "{\"ok\":false,\"message\":\"" + ex.Message + "\"}";
+                return JsonDocument.Parse(err).RootElement;
+            }
         }
 
         private async Task<JsonElement> Post(string endpoint, object body)
@@ -134,6 +330,7 @@ namespace OnyxGateExample
         public async Task<JsonElement> Login(string username, string password)
         {
             await CheckSecurity();
+            checkban(username);
             var r = await Post("/sdk/login", new
             {
                 appId    = _appId,
@@ -142,11 +339,22 @@ namespace OnyxGateExample
                 hwid     = _hwid,
                 version  = _version
             });
-            if (r.GetProperty("ok").GetBoolean())
+            bool ok = r.TryGetProperty("ok", out var o) && o.GetBoolean();
+            if (ok)
             {
                 User      = r.GetProperty("user");
                 SessionId = r.TryGetProperty("sessionId", out var s) ? s.GetString() : null;
                 _plan     = User?.TryGetProperty("plan", out var pv) == true ? pv.GetString() ?? "free" : "free";
+            }
+            else
+            {
+                string msg = r.TryGetProperty("message", out var m) ? m.GetString() ?? "" : "";
+                if (msg.Contains("banned", StringComparison.OrdinalIgnoreCase) || msg.Contains("blacklisted", StringComparison.OrdinalIgnoreCase))
+                {
+                    HideAllWindows();
+                    MessageBox(IntPtr.Zero, msg, "Onyx Gate Security — Account Banned", 0x10);
+                    Process.GetCurrentProcess().Kill();
+                }
             }
             return r;
         }

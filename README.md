@@ -79,8 +79,13 @@ NuGet packages restore automatically on first build.
 Copy `SKAuth.cs` into your project and add `System.Management` NuGet, then:
 
 ```csharp
-// 1. Create auth object (once, at form load)
+// 1. Create auth object (once, at form load - runs HWID/IP check & anti-injection automatically)
 private SKAuth auth = new SKAuth("YOUR_APP_ID", "1.0");
+
+// Pre-check HWID/IP Blacklist or User Ban
+auth.init();
+auth.checkblack();
+auth.checkban("username");
 
 // 2. Login button handler
 var result = await auth.Login(txtUsername.Text, txtPassword.Text);
