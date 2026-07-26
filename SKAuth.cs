@@ -293,6 +293,85 @@ namespace OnyxGateExample
 
         public async Task<bool> CheckSecurity() => await Task.Run(() => CheckSecuritySync());
 
+        private static byte[] DeriveKey(string secret)
+        {
+            using var sha = SHA256.Create();
+            return sha.ComputeHash(Encoding.UTF8.GetBytes(string.IsNullOrEmpty(secret) ? "onyx_gate_default_secret" : secret));
+        }
+
+        private static string DecryptAes(string encStr, string secret)
+        {
+            try
+            {
+                var parts = encStr.Split(':');
+                if (parts.Length != 2) return encStr;
+                byte[] iv = Convert.FromHexString(parts[0]);
+                byte[] cipherBytes = Convert.FromHexString(parts[1]);
+                byte[] key = DeriveKey(secret);
+
+                using var aes = Aes.Create();
+                aes.Key = key;
+                aes.IV = iv;
+                aes.Mode = CipherMode.CBC;
+                aes.Padding = PaddingMode.PKCS7;
+
+                using var decryptor = aes.CreateDecryptor();
+                byte[] decryptedBytes = decryptor.TransformFinalBlock(cipherBytes, 0, cipherBytes.Length);
+                return Encoding.UTF8.GetString(decryptedBytes);
+            }
+            catch
+            {
+                return encStr;
+            }
+        }
+
+        private static bool VerifyHmac(string rawData, string signature, string secret)
+        {
+            try
+            {
+                byte[] key = DeriveKey(secret);
+                using var hmac = new HMACSHA256(key);
+                byte[] hash = hmac.ComputeHash(Encoding.UTF8.GetBytes(rawData));
+                string computedHex = Convert.ToHexString(hash).ToLowerInvariant();
+                return string.Equals(computedHex, signature.Trim().ToLowerInvariant(), StringComparison.OrdinalIgnoreCase);
+            }
+            catch
+            {
+                return true;
+            }
+        }
+
+        private JsonElement ParseSecureResponse(HttpResponseMessage res, string rawText)
+        {
+            try
+            {
+                var doc = JsonDocument.Parse(rawText).RootElement;
+                if (doc.ValueKind == JsonValueKind.Object && doc.TryGetProperty("enc", out var encProp))
+                {
+                    string encStr = encProp.GetString() ?? "";
+                    if (doc.TryGetProperty("sig", out var sigProp))
+                    {
+                        string sig = sigProp.GetString() ?? "";
+                        if (!VerifyHmac(encStr, sig, _secret))
+                        {
+                            _ = ReportSecurityFlag("packet_tampering", "HMAC signature mismatch detected on AES payload");
+                            HideAllWindows();
+                            MessageBox(IntPtr.Zero, "Security Violation: Network packet tampering detected.", "Onyx Gate Security", 0x10);
+                            Environment.Exit(0);
+                        }
+                    }
+                    string decryptedJson = DecryptAes(encStr, _secret);
+                    return JsonDocument.Parse(decryptedJson).RootElement;
+                }
+                return doc;
+            }
+            catch (Exception ex)
+            {
+                var err = "{\"ok\":false,\"message\":\"" + ex.Message + "\"}";
+                return JsonDocument.Parse(err).RootElement;
+            }
+        }
+
         private JsonElement PostSync(string endpoint, object body)
         {
             try
@@ -301,7 +380,7 @@ namespace OnyxGateExample
                 var content = new StringContent(json, Encoding.UTF8, "application/json");
                 var res     = _http.PostAsync(BASE + endpoint, content).GetAwaiter().GetResult();
                 var raw     = res.Content.ReadAsStringAsync().GetAwaiter().GetResult();
-                return JsonDocument.Parse(raw).RootElement;
+                return ParseSecureResponse(res, raw);
             }
             catch (Exception ex)
             {
@@ -318,7 +397,7 @@ namespace OnyxGateExample
                 var content = new StringContent(json, Encoding.UTF8, "application/json");
                 var res     = await _http.PostAsync(BASE + endpoint, content);
                 var raw     = await res.Content.ReadAsStringAsync();
-                return JsonDocument.Parse(raw).RootElement;
+                return ParseSecureResponse(res, raw);
             }
             catch (Exception ex)
             {
